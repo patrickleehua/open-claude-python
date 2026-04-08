@@ -27,12 +27,7 @@ The answer is an architecture centered around a powerful **agentic tool loop** â
 ## Demo
 
 <div align="center">
-  <video src="https://raw.githubusercontent.com/patrickleehua/open-claude-python/main/images/example.mp4" controls muted playsinline preload="metadata" width="960">
-    Your browser does not support embedded videos.
-  </video>
-  <p>
-    <a href="https://raw.githubusercontent.com/patrickleehua/open-claude-python/main/images/example.mp4">Open the demo video directly</a>
-  </p>
+  <img src="images/example.gif" alt="Demo" width="960" />
 </div>
 
 ## Architecture Overview
