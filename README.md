@@ -27,11 +27,11 @@ The answer is an architecture centered around a powerful **agentic tool loop** â
 ## Demo
 
 <div align="center">
-  <video src="./images/example.mp4" controls muted playsinline preload="metadata" width="960">
+  <video src="https://raw.githubusercontent.com/patrickleehua/open-claude-python/main/images/example.mp4" controls muted playsinline preload="metadata" width="960">
     Your browser does not support embedded videos.
   </video>
   <p>
-    <a href="./images/example.mp4">Open the demo video directly</a>
+    <a href="https://raw.githubusercontent.com/patrickleehua/open-claude-python/main/images/example.mp4">Open the demo video directly</a>
   </p>
 </div>
 
