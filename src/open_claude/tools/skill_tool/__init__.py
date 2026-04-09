@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from open_claude.schemas import ToolExecutionResult
 from open_claude.tools.base import Tool, ToolError
 
 
@@ -66,8 +67,66 @@ class SkillTool(Tool):
     def is_read_only(self, input_data: BaseModel) -> bool:
         return True
 
-    async def call(self, input_data: BaseModel) -> str:
+    async def call(self, input_data: BaseModel) -> ToolExecutionResult:
+        """Execute the skill and return structured result with new_messages.
+
+        Mirrors the TS SkillTool.call() flow:
+        1. Look up skill in registry
+        2. Call get_prompt_for_command(args, context)
+        3. Build metadata wrapping (<command-message>, <command-name> tags)
+        4. Return ToolExecutionResult with skill content as new_messages
+        5. The query engine injects new_messages as user messages
+        """
         data = input_data  # type: SkillToolInput
-        raise ToolError(
-            f"Skill '{data.skill}' is not yet implemented in open-claude-python."
+        skill_name = data.skill.lstrip("/")
+        args = data.args or ""
+
+        from open_claude.skills import get_skill_registry
+
+        registry = get_skill_registry()
+        skill = registry.find(skill_name)
+
+        if skill is None:
+            available = [s.name for s in registry.get_user_invocable()]
+            raise ToolError(
+                f"Skill '{skill_name}' not found. Available skills: {available}"
+            )
+
+        if skill.get_prompt_for_command is None:
+            raise ToolError(
+                f"Skill '{skill_name}' has no prompt generator."
+            )
+
+        blocks = await skill.get_prompt_for_command(args, {})
+
+        # Extract text from content blocks
+        text_parts = []
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+        prompt_content = "\n".join(t for t in text_parts if t)
+
+        if not prompt_content:
+            return ToolExecutionResult(output=f"Skill '{skill_name}' returned empty content.")
+
+        # Build metadata wrapping (matches TS formatSlashCommandLoadingMetadata)
+        metadata_lines = [
+            f"<command-message>{skill_name}</command-message>",
+            f"<command-name>/{skill_name}</command-name>",
+        ]
+        if args:
+            metadata_lines.append(f"<command-args>{args}</command-args>")
+
+        # Build new_messages: metadata + skill content as user messages
+        # (mirrors TS getMessagesForPromptSlashCommand message construction)
+        new_messages = [
+            # Metadata user message (visible marker for the skill invocation)
+            {"role": "user", "content": "\n".join(metadata_lines)},
+            # Skill content as user message (the actual instructions)
+            {"role": "user", "content": prompt_content},
+        ]
+
+        return ToolExecutionResult(
+            output=f"Launching skill: {skill_name}",
+            new_messages=new_messages,
         )

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from open_claude.schemas import ToolExecutionResult
 from open_claude.tools.base import Tool, ToolError
 from open_claude.tools.shared.utils import expand_path
+from open_claude.utils.diff import build_file_diff_preview
 
 
 class FileEditToolInput(BaseModel):
@@ -69,7 +71,7 @@ class FileEditTool(Tool):
     def is_read_only(self, input_data: BaseModel) -> bool:
         return False
 
-    async def call(self, input_data: BaseModel) -> str:
+    async def call(self, input_data: BaseModel) -> str | ToolExecutionResult:
         data = input_data  # type: FileEditToolInput
         path = expand_path(data.file_path)
 
@@ -109,9 +111,23 @@ class FileEditTool(Tool):
             replaced = 1
 
         # Write back
+        preview = build_file_diff_preview(
+            file_path=str(path),
+            old_content=content,
+            new_content=new_content,
+            operation="edit",
+        )
+
         try:
             path.write_text(new_content, encoding="utf-8")
         except OSError as exc:
             raise ToolError(f"Failed to write file: {exc}")
 
-        return f"Edited {path}: replaced {replaced} occurrence(s)"
+        return ToolExecutionResult(
+            output=f"Edited {path}: replaced {replaced} occurrence(s)",
+            display_data=preview.to_display_data(
+                title=f"Edit {path.name}",
+                status="applied",
+                dim=False,
+            ),
+        )

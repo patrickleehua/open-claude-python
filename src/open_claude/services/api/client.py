@@ -163,8 +163,16 @@ def _create_direct_client(config: ClientConfig, headers: dict[str, str]) -> Asyn
     return AsyncAnthropic(**client_kwargs)
 
 
+# Module-level singleton — ensures sub-agents reuse the parent's client.
+_cached_client: AsyncAnthropic | None = None
+
+
 def get_client(config: ClientConfig | None = None) -> AsyncAnthropic:
-    """Create an AsyncAnthropic client based on the detected provider.
+    """Create (or return cached) AsyncAnthropic client based on the detected provider.
+
+    The first call with an explicit ``config`` creates and caches the client.
+    Subsequent calls (with or without config) return the same instance, so
+    sub-agents spawned by AgentTool automatically reuse the parent's credentials.
 
     Supports three providers:
     - Direct Anthropic API (default)
@@ -173,14 +181,23 @@ def get_client(config: ClientConfig | None = None) -> AsyncAnthropic:
 
     Provider detection priority: Bedrock > Vertex > Direct.
     """
+    global _cached_client
+
+    # Return cached client when caller doesn't supply a custom config
     if config is None:
+        if _cached_client is not None:
+            return _cached_client
         config = ClientConfig()
 
     headers = _build_default_headers(config)
     provider = _detect_provider(config)
 
     if provider == "bedrock":
-        return _create_bedrock_client(config, headers)
-    if provider == "vertex":
-        return _create_vertex_client(config, headers)
-    return _create_direct_client(config, headers)
+        client = _create_bedrock_client(config, headers)
+    elif provider == "vertex":
+        client = _create_vertex_client(config, headers)
+    else:
+        client = _create_direct_client(config, headers)
+
+    _cached_client = client
+    return client

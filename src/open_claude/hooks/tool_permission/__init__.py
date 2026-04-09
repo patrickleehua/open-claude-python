@@ -125,6 +125,7 @@ class PermissionContext:
         user_modified: bool = False,
         decision_reason: Any = None,
         accept_feedback: str | None = None,
+        display_data: dict[str, Any] | None = None,
     ) -> PermissionAllowDecision:
         """Build an allow decision."""
         return PermissionAllowDecision(
@@ -132,22 +133,25 @@ class PermissionContext:
             user_modified=user_modified,
             decision_reason=decision_reason,
             accept_feedback=accept_feedback,
+            display_data=display_data,
         )
 
     def build_deny(
         self,
         message: str,
         decision_reason: Any = None,
+        display_data: dict[str, Any] | None = None,
     ) -> PermissionDenyDecision:
         """Build a deny decision."""
         return PermissionDenyDecision(
             message=message,
             decision_reason=decision_reason,
+            display_data=display_data,
         )
 
-    def build_ask(self, message: str) -> PermissionAskDecision:
+    def build_ask(self, message: str, display_data: dict[str, Any] | None = None) -> PermissionAskDecision:
         """Build an ask decision."""
-        return PermissionAskDecision(message=message)
+        return PermissionAskDecision(message=message, display_data=display_data)
 
     async def handle_user_allow(
         self,
@@ -155,6 +159,7 @@ class PermissionContext:
         permission_updates: list[PermissionUpdate],
         feedback: str | None = None,
         decision_reason: Any = None,
+        display_data: dict[str, Any] | None = None,
     ) -> PermissionAllowDecision:
         """Handle a user approval — persist permissions and build allow."""
         accepted_permanent = await self.persist_permissions(permission_updates)
@@ -165,6 +170,7 @@ class PermissionContext:
             user_modified=user_modified,
             decision_reason=decision_reason,
             accept_feedback=feedback.strip() if feedback else None,
+            display_data=display_data,
         )
 
 

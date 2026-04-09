@@ -45,6 +45,16 @@ class ToolResult(BaseModel):
     tool_call_id: str
     output: str
     is_error: bool = False
+    display_data: dict[str, Any] | None = None
+    new_messages: list[dict[str, Any]] | None = None
+
+
+class ToolExecutionResult(BaseModel):
+    """Structured result returned by a tool executor."""
+
+    output: str
+    display_data: dict[str, Any] | None = None
+    new_messages: list[dict[str, Any]] | None = None
 
 
 class ConversationConfig(BaseModel):

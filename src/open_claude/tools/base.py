@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from open_claude.schemas import ToolExecutionResult
+
 
 class ToolError(Exception):
     """Raised when a tool encounters an error during execution."""
@@ -56,14 +58,14 @@ class Tool(ABC):
         ...
 
     @abstractmethod
-    async def call(self, input_data: BaseModel) -> str:
+    async def call(self, input_data: BaseModel) -> str | ToolExecutionResult:
         """Execute the tool and return a string result for the model.
 
         Args:
             input_data: Validated Pydantic model instance matching input_schema.
 
         Returns:
-            String output to send back to the model as tool_result content.
+            String output or a structured tool result to send back to the model.
         """
         ...
 

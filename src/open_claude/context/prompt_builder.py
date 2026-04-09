@@ -415,6 +415,23 @@ async def build_user_context(
         entries.append(f"# claudeMd\n{claude_md_section}")
     entries.append(f"# currentDate\n{date_str}")
 
+    # Inject available skills list
+    try:
+        from open_claude.skills import get_skill_registry
+        skill_cmds = get_skill_registry().get_skill_commands_for_prompt()
+        if skill_cmds:
+            skill_lines = ["The following skills are available for use with the Skill tool:"]
+            for sc in skill_cmds:
+                line = f'- {sc["name"]}'
+                if sc.get("argumentHint"):
+                    line += f' {sc["argumentHint"]}'
+                if sc.get("description"):
+                    line += f': {sc["description"]}'
+                skill_lines.append(line)
+            entries.append("# skills\n" + "\n".join(skill_lines))
+    except Exception:
+        pass
+
     if not entries:
         return None
 

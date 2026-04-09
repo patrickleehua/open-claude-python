@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from typing import Any
 
@@ -26,6 +27,7 @@ from open_claude.components.ui.message_widgets import (
     AssistantMessage,
     UserMessage,
 )
+from open_claude.utils.diff import display_data_for_preview, preview_for_tool_input
 
 try:
     from open_claude.commands import get_registry
@@ -40,6 +42,15 @@ try:
     from open_claude.services.api import ClientConfig, get_client
     from open_claude.services.settings import load_settings
     from open_claude.tools import create_tool_executor, get_all_tools_async, get_builtin_tools
+    from open_claude.utils.message_queue_manager import (
+        QueuedCommand,
+        dequeue,
+        drain_pending_task_notifications,
+        enqueue,
+        peek,
+        snapshot,
+    )
+    from open_claude.utils.query_guard import QueryGuard
 except ImportError:
     APP_NAME = "open-claude-python"
     APP_VERSION = "0.1.0"
@@ -101,7 +112,7 @@ class _PermissionDialog(ModalScreen[str]):
             yield Static(f"Permission Required: {self.tool_name}", id="permission-title")
             yield Static(self.message)
             if self.details:
-                yield Static(f"Details: {self.details}", id="permission-tool-details", classes="permission-details")
+                yield Static(self.details, id="permission-tool-details", classes="permission-details")
             yield Static(f"Current mode: {self.mode}", id="permission-mode-details", classes="permission-details")
             with Horizontal(id="permission-actions"):
                 yield Button("Allow Once", id="allow_once", variant="primary")
@@ -392,6 +403,18 @@ class ChatApp(App):
     #command-suggestions.visible {
         display: block;
     }
+    #queue-status {
+        display: none;
+        height: auto;
+        margin: 0 0 1 0;
+        padding: 1 1;
+        background: $surface-lighten-1;
+        border: round $surface-lighten-2;
+        color: $text-disabled;
+    }
+    #queue-status.visible {
+        display: block;
+    }
     #user-input {
         width: 100%;
         background: transparent;
@@ -449,6 +472,9 @@ class ChatApp(App):
         self._tool_defs: list[dict] | None = None
         self._tool_executor = None
         self._permission_context: ToolPermissionContext = ToolPermissionContext()
+        self._query_guard = QueryGuard()
+        self._active_abort_event: asyncio.Event | None = None
+        self._queue_processing = False
         self._default_input_placeholder = '> Try "help" for commands'
         self._command_suggestions: list[tuple[str, str]] = []
         self._selected_command_index = 0
@@ -466,6 +492,7 @@ class ChatApp(App):
         with Static(id="input-border"):
             yield Static("", id="permission-status")
             yield Static("", id="command-suggestions")
+            yield Static("", id="queue-status")
             yield Input(
                 placeholder=self._default_input_placeholder,
                 id="user-input",
@@ -476,17 +503,6 @@ class ChatApp(App):
     async def on_mount(self) -> None:
         settings = load_settings()
         self._model_name = self._override_model or settings.model or DEFAULT_MODEL
-
-        try:
-            assembly = await build_prompt_assembly(
-                messages=[], custom_prompt=self._override_system_prompt,
-            )
-        except Exception:
-            assembly = PromptAssembly(
-                system_prompt=self._override_system_prompt or SYSTEM_PROMPT_DEFAULT,
-                system_reminder=None,
-                messages=[],
-            )
 
         from open_claude.utils.permissions.setup import initialize_tool_permission_context
         self._permission_context = initialize_tool_permission_context()
@@ -502,6 +518,34 @@ class ChatApp(App):
             mode=perm_mode,
             allowed_tools=allow_list,
         )
+
+        # Initialize bundled skills
+        from open_claude.skills import init_bundled_skills, get_skill_registry
+        init_bundled_skills()
+
+        # Load disk-based skills (~/.claude/skills/, .claude/skills/, .claude/commands/)
+        from open_claude.skills.load_skills_dir import load_all_disk_skills
+        disk_skills = await load_all_disk_skills(os.getcwd())
+        registry = get_skill_registry()
+        for skill in disk_skills:
+            registry.register(skill)
+
+        # Load tools FIRST so we can pass enabled_tools to prompt assembly
+        await self._refresh_tooling(include_mcp=False)
+        enabled_tool_names = {t.name for t in get_builtin_tools()}
+
+        try:
+            assembly = await build_prompt_assembly(
+                messages=[], custom_prompt=self._override_system_prompt,
+                enabled_tools=enabled_tool_names,
+                skill_tool_commands=get_skill_registry().get_skill_commands_for_prompt(),
+            )
+        except Exception:
+            assembly = PromptAssembly(
+                system_prompt=self._override_system_prompt or SYSTEM_PROMPT_DEFAULT,
+                system_reminder=None,
+                messages=[],
+            )
 
         client = get_client(ClientConfig(api_key=settings.api_key, api_url=settings.base_url))
 
@@ -533,9 +577,6 @@ class ChatApp(App):
         self._conversation = list(assembly.messages)
         self._sync_permission_context_to_engine()
 
-        # Initialize with built-in tools only so the UI never blocks on MCP.
-        await self._refresh_tooling(include_mcp=False)
-
         chat_area = self.query_one("#chat-area", VerticalScroll)
         await chat_area.mount(Static(
             f"[bold]{APP_NAME}[/bold] v{APP_VERSION}\n"
@@ -544,6 +585,7 @@ class ChatApp(App):
             classes="welcome-block",
         ))
         self._update_permission_status()
+        self._render_queue_status()
         self._scroll_chat_to_end(force=True)
 
         self.query_one("#user-input", Input).focus()
@@ -562,10 +604,7 @@ class ChatApp(App):
             now = time.monotonic()
             if self._is_streaming:
                 # Cancel current streaming
-                self._is_streaming = False
-                workers = list(self.workers)
-                for w in workers:
-                    w.cancel()
+                self._interrupt_current_turn()
                 chat_area = self.query_one("#chat-area", VerticalScroll)
                 await chat_area.mount(Static("[dim]— interrupted —[/dim]"))
                 self._scroll_chat_to_end(force=True)
@@ -599,13 +638,17 @@ class ChatApp(App):
 
         if event.key == "up":
             event.prevent_default()
-            self._selected_command_index = max(0, self._selected_command_index - 1)
+            self._selected_command_index = (
+                (self._selected_command_index - 1) % len(self._command_suggestions)
+            )
             self._render_command_suggestions()
             return
 
         if event.key == "down":
             event.prevent_default()
-            self._selected_command_index = min(len(self._command_suggestions) - 1, self._selected_command_index + 1)
+            self._selected_command_index = (
+                (self._selected_command_index + 1) % len(self._command_suggestions)
+            )
             self._render_command_suggestions()
             return
 
@@ -660,21 +703,16 @@ class ChatApp(App):
 
         chat_area = self.query_one("#chat-area", VerticalScroll)
 
-        if user_input.startswith("/"):
-            await self._handle_slash_command(user_input, chat_area)
+        if self._query_guard.is_active:
+            await self._enqueue_user_input(user_input)
             return
 
-        await chat_area.mount(UserMessage(user_input))
-        self._scroll_chat_to_end(force=True)
-        self._conversation.append(build_user_message(user_input))
+        if user_input.startswith("/"):
+            await self._handle_slash_command(user_input, chat_area)
+            await self._process_queue_if_ready()
+            return
 
-        assistant = AssistantMessage()
-        await chat_area.mount(assistant)
-        self._current_assistant = assistant
-        self._scroll_chat_to_end(force=True)
-
-        self._is_streaming = True
-        self._stream_response()
+        await self._begin_prompt_turn(user_input)
 
     @on(Input.Changed)
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -683,7 +721,7 @@ class ChatApp(App):
     # --------------------------------------------------------------- streaming
 
     @work(exclusive=True)
-    async def _stream_response(self) -> None:
+    async def _stream_response(self, generation: int, abort_event: asyncio.Event) -> None:
         if not self._engine:
             return
 
@@ -697,6 +735,7 @@ class ChatApp(App):
                 self._conversation,
                 tools=self._tool_defs,
                 tool_executor=self._tool_executor,
+                abort_event=abort_event,
             ):
                 if not self._is_streaming:
                     break
@@ -727,6 +766,7 @@ class ChatApp(App):
                             tr.tool_call_id,
                             tr.output,
                             tr.is_error,
+                            tr.display_data,
                         )
                     self._scroll_chat_to_end()
 
@@ -741,6 +781,11 @@ class ChatApp(App):
                 self._conversation.pop()
         finally:
             self._is_streaming = False
+            self._active_abort_event = None
+            self._query_guard.end(generation)
+
+            if self._current_assistant:
+                self._current_assistant.finalize_pending_state()
 
             if self._current_assistant and thinking_text:
                 await self._current_assistant.set_thinking(thinking_text, streaming=False)
@@ -753,6 +798,122 @@ class ChatApp(App):
             # We just need to handle the final assistant content for display purposes.
             self.query_one("#user-input", Input).focus()
             self._scroll_chat_to_end(force=True)
+            await self._process_queue_if_ready()
+
+    async def _begin_prompt_turn(
+        self,
+        user_input: str,
+        *,
+        generation: int | None = None,
+        render_user_message: bool = True,
+        display_text: str | None = None,
+    ) -> bool:
+        if generation is None:
+            generation = self._query_guard.try_start()
+        if generation is None:
+            return False
+
+        chat_area = self.query_one("#chat-area", VerticalScroll)
+
+        if render_user_message:
+            await chat_area.mount(UserMessage(display_text or user_input))
+            self._scroll_chat_to_end(force=True)
+
+        self._conversation.append(build_user_message(user_input))
+
+        assistant = AssistantMessage()
+        await chat_area.mount(assistant)
+        self._current_assistant = assistant
+        self._scroll_chat_to_end(force=True)
+
+        self._active_abort_event = asyncio.Event()
+        self._is_streaming = True
+        self._stream_response(generation, self._active_abort_event)
+        return True
+
+    async def _enqueue_user_input(self, user_input: str) -> None:
+        mode = "slash" if user_input.startswith("/") else "prompt"
+        enqueue(QueuedCommand(value=user_input, mode=mode, rendered=False))
+        self._render_queue_status()
+
+    async def _process_queue_if_ready(self) -> None:
+        if self._queue_processing:
+            return
+
+        self._queue_processing = True
+        try:
+            chat_area = self.query_one("#chat-area", VerticalScroll)
+            while not self._query_guard.is_active:
+                drain_pending_task_notifications()
+                next_cmd = peek(lambda cmd: cmd.agent_id is None)
+                if next_cmd is None:
+                    return
+                if not self._query_guard.reserve():
+                    return
+
+                cmd = dequeue(lambda cmd: cmd.agent_id is None)
+                if cmd is None:
+                    self._query_guard.cancel_reservation()
+                    self._render_queue_status()
+                    return
+                self._render_queue_status()
+
+                if cmd.mode == "slash":
+                    self._query_guard.cancel_reservation()
+                    await self._handle_slash_command(cmd.value, chat_area)
+                    continue
+
+                generation = self._query_guard.try_start()
+                if generation is None:
+                    enqueue(cmd)
+                    return
+
+                started = await self._begin_prompt_turn(
+                    cmd.value,
+                    generation=generation,
+                    render_user_message=not cmd.rendered and cmd.mode == "prompt",
+                )
+                if not started:
+                    enqueue(cmd)
+                    self._render_queue_status()
+                return
+        finally:
+            self._queue_processing = False
+
+    def _interrupt_current_turn(self) -> None:
+        if self._active_abort_event is not None and not self._active_abort_event.is_set():
+            self._active_abort_event.set()
+        self._is_streaming = False
+
+    def _render_queue_status(self) -> None:
+        if not self.is_mounted:
+            return
+        widget = self.query_one("#queue-status", Static)
+        queued = [cmd for cmd in snapshot() if cmd.agent_id is None and cmd.mode in {"prompt", "slash"}]
+        if not queued:
+            widget.update("")
+            widget.remove_class("visible")
+            return
+
+        head = queued[0]
+        lines = [
+            f"[bold]Queued {len(queued)}[/bold]  next up pops in when the current turn finishes",
+            f"◉ {self._format_queue_label(head)}",
+        ]
+        for cmd in queued[1:4]:
+            lines.append(f"○ {self._format_queue_label(cmd)}")
+        if len(queued) > 4:
+            lines.append(f"[dim]+{len(queued) - 4} more[/dim]")
+
+        widget.update("\n".join(lines))
+        widget.add_class("visible")
+
+    def _format_queue_label(self, cmd: QueuedCommand) -> str:
+        text = cmd.value.strip().replace("\n", " ")
+        if len(text) > 72:
+            text = f"{text[:69]}..."
+        prefix = "/ " if cmd.mode == "slash" else ""
+        return f"{prefix}{text}"
 
     # ------------------------------------------------------------ key actions
 
@@ -767,6 +928,9 @@ class ChatApp(App):
         self._tool_defs = [tool.get_api_definition() for tool in tools]
         self._tool_executor = create_tool_executor(tools)
 
+        # Rebuild system prompt so enabled_tools guidance stays in sync
+        await self._rebuild_system_prompt()
+
     def _schedule_mcp_tool_refresh(self) -> None:
         if self._mcp_refresh_task_started:
             return
@@ -778,6 +942,22 @@ class ChatApp(App):
             await self._refresh_tooling(include_mcp=True)
         finally:
             self._mcp_refresh_task_started = False
+
+    async def _rebuild_system_prompt(self) -> None:
+        """Rebuild the system prompt using current enabled tool names."""
+        try:
+            from open_claude.skills import get_skill_registry
+            enabled_tool_names = {t.name for t in get_builtin_tools()}
+            assembly = await build_prompt_assembly(
+                messages=[],
+                custom_prompt=self._override_system_prompt,
+                enabled_tools=enabled_tool_names,
+                skill_tool_commands=get_skill_registry().get_skill_commands_for_prompt(),
+            )
+            if self._engine is not None:
+                self._engine.system_prompt = assembly.system_prompt
+        except Exception:
+            pass
 
     def action_toggle_thinking(self) -> None:
         chat_area = self._chat_area()
@@ -853,6 +1033,44 @@ class ChatApp(App):
             await self._show_permission_mode_dialog()
             return
 
+        # --- skill-based commands (e.g. /simplify, /batch, /debug) -----------
+        from open_claude.skills import get_skill_registry as get_skill_reg
+        skill_registry = get_skill_reg()
+
+        # Parse skill name and args from "/skill-name args..."
+        skill_part = raw[1:]  # strip leading /
+        skill_name, _, skill_args = skill_part.partition(" ")
+        skill_name = skill_name.strip()
+        skill_args = skill_args.strip()
+
+        skill = skill_registry.find(skill_name)
+        if skill and skill.user_invocable and skill.is_enabled():
+            # Skill found — render the user's slash command, then send the
+            # skill prompt content as a user message so the model acts on it.
+            if skill.get_prompt_for_command:
+                import asyncio
+                blocks = await skill.get_prompt_for_command(skill_args, {})
+                text_parts = [
+                    b.get("text", "") for b in blocks
+                    if isinstance(b, dict) and b.get("type") == "text"
+                ]
+                prompt_content = "\n".join(t for t in text_parts if t)
+                if prompt_content:
+                    # Build metadata wrapping (matches TS formatSlashCommandLoadingMetadata)
+                    metadata_lines = [
+                        f"<command-message>{skill_name}</command-message>",
+                        f"<command-name>/{skill_name}</command-name>",
+                    ]
+                    if skill_args:
+                        metadata_lines.append(f"<command-args>{skill_args}</command-args>")
+                    full_content = "\n".join(metadata_lines) + "\n\n" + prompt_content
+                    await self._begin_prompt_turn(
+                        full_content,
+                        display_text=raw,
+                        render_user_message=True,
+                    )
+                    return
+
         # --- registry-based commands -----------------------------------------
         registry = get_registry()
         ctx = _ChatAppContext(self)
@@ -890,15 +1108,10 @@ class ChatApp(App):
 
         if result.should_query and result.prompt_content:
             # PromptCommand — inject the prompt as a user message and stream
-            await chat_area.mount(UserMessage(input_text))
-            self._scroll_chat_to_end(force=True)
-            self._conversation.append(build_user_message(result.prompt_content))
-            assistant = AssistantMessage()
-            await chat_area.mount(assistant)
-            self._current_assistant = assistant
-            self._scroll_chat_to_end(force=True)
-            self._is_streaming = True
-            self._stream_response()
+            await self._begin_prompt_turn(
+                result.prompt_content,
+                display_text=input_text,
+            )
             return
 
         # Default: display the text result
@@ -963,6 +1176,14 @@ class ChatApp(App):
         return "\n".join(lines)
 
     def _summarize_tool_input(self, tool_name: str, tool_input: dict[str, Any]) -> str:
+        preview = preview_for_tool_input(tool_name, tool_input)
+        if preview is not None:
+            return display_data_for_preview(
+                preview,
+                tool_name=tool_name,
+                status="preview",
+                dim=False,
+            )["markup"]  # type: ignore[index]
         if tool_name == "Bash":
             return str(tool_input.get("command", ""))
         if tool_name in {"Read", "Write", "Edit"}:
@@ -980,10 +1201,17 @@ class ChatApp(App):
         tool_use_id: str,
         decision: PermissionAskDecision,
     ):
+        preview = preview_for_tool_input(tool_name, tool_input)
+        preview_display = display_data_for_preview(
+            preview,
+            tool_name=tool_name,
+            status="preview",
+            dim=False,
+        )
         dialog = _PermissionDialog(
             tool_name=tool_name,
             message=decision.message,
-            details=self._summarize_tool_input(tool_name, tool_input),
+            details=(preview_display or {}).get("markup", self._summarize_tool_input(tool_name, tool_input)),
             mode=self._permission_context.mode.value,
         )
         choice = await self._show_permission_dialog(dialog)
@@ -1009,6 +1237,7 @@ class ChatApp(App):
                 updated_input=tool_input,
                 permission_updates=[],
                 decision_reason=getattr(decision, "decision_reason", None),
+                display_data=preview_display,
             )
         if choice == "allow_session":
             return await ctx.handle_user_allow(
@@ -1021,18 +1250,21 @@ class ChatApp(App):
                     )
                 ],
                 decision_reason=getattr(decision, "decision_reason", None),
+                display_data=preview_display,
             )
         if choice == "mode_auto":
             self._set_permission_mode(PermissionMode.AUTO)
             return ctx.build_allow(
                 updated_input=tool_input,
                 decision_reason=getattr(decision, "decision_reason", None),
+                display_data=preview_display,
             )
         if choice == "mode_bypass":
             self._set_permission_mode(PermissionMode.BYPASS_PERMISSIONS)
             return ctx.build_allow(
                 updated_input=tool_input,
                 decision_reason=getattr(decision, "decision_reason", None),
+                display_data=preview_display,
             )
 
         from open_claude.schemas.permissions import PermissionDenyDecision
@@ -1040,6 +1272,12 @@ class ChatApp(App):
         return PermissionDenyDecision(
             message=f"User denied permission for {tool_name}.",
             decision_reason=getattr(decision, "decision_reason", None),
+            display_data=display_data_for_preview(
+                preview,
+                tool_name=tool_name,
+                status="rejected",
+                dim=True,
+            ),
         )
 
     def _record_input_history(self, user_input: str) -> None:
@@ -1192,7 +1430,21 @@ class ChatApp(App):
             suggestions.append((label, cmd.description))
             seen.add(label)
 
-        return suggestions[:8]
+        # Include skill suggestions
+        from open_claude.skills import get_skill_registry as get_skill_reg
+        for skill in sorted(get_skill_reg().get_user_invocable(), key=lambda s: s.name):
+            names = [skill.name, *skill.aliases]
+            matched_name = next((n for n in names if not prefix or n.lower().startswith(prefix)), None)
+            if matched_name is None:
+                continue
+            label = f"/{matched_name}"
+            if label in seen:
+                continue
+            desc = skill.description[:80] + "..." if len(skill.description) > 80 else skill.description
+            suggestions.append((label, desc))
+            seen.add(label)
+
+        return suggestions
 
     def _update_command_suggestions(self, input_text: str) -> None:
         self._command_suggestions = self._get_command_suggestions(input_text)
@@ -1206,11 +1458,28 @@ class ChatApp(App):
             widget.remove_class("visible")
             return
 
+        max_visible = 8
+        total = len(self._command_suggestions)
+        start = 0
+        if total > max_visible:
+            start = max(
+                0,
+                min(
+                    self._selected_command_index - max_visible // 2,
+                    total - max_visible,
+                ),
+            )
+        end = min(total, start + max_visible)
+        visible = self._command_suggestions[start:end]
+
         lines = ["[dim]Commands: ↑/↓ select, Tab complete[/dim]"]
-        for index, (label, description) in enumerate(self._command_suggestions):
-            prefix = "›" if index == self._selected_command_index else " "
-            style_open = "[bold]" if index == self._selected_command_index else ""
-            style_close = "[/bold]" if index == self._selected_command_index else ""
+        if total > max_visible:
+            lines[0] += f" [dim]({self._selected_command_index + 1}/{total})[/dim]"
+
+        for offset, (label, description) in enumerate(visible, start=start):
+            prefix = "›" if offset == self._selected_command_index else " "
+            style_open = "[bold]" if offset == self._selected_command_index else ""
+            style_close = "[/bold]" if offset == self._selected_command_index else ""
             lines.append(f"{prefix} {style_open}{label:<12}{style_close} {description}")
         widget.update("\n".join(lines))
         widget.add_class("visible")

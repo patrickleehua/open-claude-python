@@ -182,6 +182,9 @@ TYPES_SECTION_INDIVIDUAL: list[str] = [
     "",
 ]
 
+# Default to combined version for backwards compatibility
+TYPES_SECTION = TYPES_SECTION_COMBINED
+
 WHAT_NOT_TO_SAVE_SECTION: list[str] = [
     "## What NOT to save in memory",
     "",

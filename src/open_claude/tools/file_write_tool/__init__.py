@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from open_claude.schemas import ToolExecutionResult
 from open_claude.tools.base import Tool, ToolError
 from open_claude.tools.shared.utils import expand_path
+from open_claude.utils.diff import build_file_diff_preview
 
 
 class FileWriteToolInput(BaseModel):
@@ -57,7 +59,7 @@ class FileWriteTool(Tool):
     def is_read_only(self, input_data: BaseModel) -> bool:
         return False
 
-    async def call(self, input_data: BaseModel) -> str:
+    async def call(self, input_data: BaseModel) -> str | ToolExecutionResult:
         data = input_data  # type: FileWriteToolInput
         path = expand_path(data.file_path)
 
@@ -70,6 +72,20 @@ class FileWriteTool(Tool):
         # Determine create vs update
         is_update = path.exists()
 
+        old_content = ""
+        if is_update:
+            try:
+                old_content = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                raise ToolError(f"Cannot read file as UTF-8 text: {path}")
+
+        preview = build_file_diff_preview(
+            file_path=str(path),
+            old_content=old_content,
+            new_content=data.content,
+            operation="overwrite" if is_update else "create",
+        )
+
         # Write content
         try:
             path.write_text(data.content, encoding="utf-8")
@@ -80,4 +96,11 @@ class FileWriteTool(Tool):
         line_count = data.content.count("\n") + (
             1 if data.content and not data.content.endswith("\n") else 0
         )
-        return f"File {action} successfully: {path} ({line_count} lines)"
+        return ToolExecutionResult(
+            output=f"File {action} successfully: {path} ({line_count} lines)",
+            display_data=preview.to_display_data(
+                title=f"Write {path.name}",
+                status="applied",
+                dim=False,
+            ),
+        )

@@ -24,6 +24,7 @@ from open_claude.schemas.permissions import (
     ToolPermissionContext,
 )
 from open_claude.hooks.tool_permission import create_permission_context
+from open_claude.utils.diff import display_data_for_preview, preview_for_tool_input
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +69,16 @@ async def prompt_for_permission(
     )
 
     # Show tool input summary
-    input_summary = _format_tool_input(tool_name, tool_input)
+    preview = preview_for_tool_input(tool_name, tool_input)
+    preview_display = display_data_for_preview(
+        preview,
+        tool_name=tool_name,
+        status="preview",
+        dim=False,
+    )
+    input_summary = preview_display["markup"] if preview_display else _format_tool_input(tool_name, tool_input)
     if input_summary:
-        console.print(f"  [dim]Details:[/dim] {input_summary}")
+        console.print(input_summary)
 
     # Prompt the user
     console.print()
@@ -180,9 +188,16 @@ async def interactive_permission_check(
             permission_updates=updates,
             feedback=result.feedback,
             decision_reason=getattr(decision, "decision_reason", None),
+            display_data=preview_display,
         )
     else:
         return PermissionDenyDecision(
             message=f"User denied permission for {tool_name}."
             + (f" Feedback: {result.feedback}" if result.feedback else ""),
+            display_data=display_data_for_preview(
+                preview,
+                tool_name=tool_name,
+                status="rejected",
+                dim=True,
+            ),
         )

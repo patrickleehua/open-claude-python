@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Container
+from textual.timer import Timer
 from textual.widgets import Markdown, Static
 
 
@@ -12,6 +13,69 @@ class UserMessage(Static):
 
     def __init__(self, text: str, **kwargs) -> None:
         super().__init__(f"[bold cyan]>[/bold cyan] {text}", **kwargs)
+
+
+class AssistantLoadingIndicator(Static):
+    """Animated pending-response indicator."""
+
+    DEFAULT_CSS = """
+    AssistantLoadingIndicator {
+        height: auto;
+        color: $text-disabled;
+        margin: 0 0 1 0;
+    }
+    """
+
+    _DOT_FRAMES = [
+        "○",
+        "●",
+    ]
+    _GLOW_WIDTH = 6
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__("", **kwargs)
+        self._frame_index = 0
+        self._glow_position = -8.0
+        self._timer: Timer | None = None
+
+    def on_mount(self) -> None:
+        self._timer = self.set_interval(0.22, self._tick)
+        self._refresh_display()
+
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    def _tick(self) -> None:
+        self._frame_index = (self._frame_index + 1) % len(self._DOT_FRAMES)
+        self._glow_position += 0.55
+        if self._glow_position > 24:
+            self._glow_position = -8.0
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        self.update(
+            "[white]"
+            f"{self._DOT_FRAMES[self._frame_index]}  {self._render_glowing_word()}[/white]"
+        )
+
+    def _render_glowing_word(self) -> str:
+        word = "Clauding"
+        chars: list[str] = []
+        for idx, char in enumerate(word):
+            distance = abs(idx - self._glow_position)
+            if distance < 0.45:
+                chars.append(f"[bold white]{char}[/bold white]")
+            elif distance < 1.1:
+                chars.append(f"[white]{char}[/white]")
+            elif distance < 2.0:
+                chars.append(f"[grey70]{char}[/grey70]")
+            elif distance < self._GLOW_WIDTH:
+                chars.append(f"[grey50]{char}[/grey50]")
+            else:
+                chars.append(f"[grey35]{char}[/grey35]")
+        return "".join(chars)
 
 
 class ThinkingSection(Static):
@@ -89,14 +153,22 @@ class ToolSummarySection(Static):
             "input": tool_input or {},
             "output": None,
             "is_error": False,
+            "display_data": None,
         })
         self._refresh_display()
 
-    def set_tool_result(self, tool_call_id: str, output: str, is_error: bool) -> None:
+    def set_tool_result(
+        self,
+        tool_call_id: str,
+        output: str,
+        is_error: bool,
+        display_data: dict | None = None,
+    ) -> None:
         for item in self._items:
             if item["id"] == tool_call_id:
                 item["output"] = output
                 item["is_error"] = is_error
+                item["display_data"] = display_data
                 break
         self._refresh_display()
 
@@ -141,6 +213,14 @@ class ToolSummarySection(Static):
         input_data = item["input"]
         output = item["output"]
         is_error = item["is_error"]
+        display_data = item.get("display_data")
+
+        if isinstance(display_data, dict) and display_data.get("kind") == "file_diff":
+            title = str(display_data.get("title") or name)
+            status = str(display_data.get("status") or ("failed" if is_error else "applied"))
+            markup = str(display_data.get("markup") or "")
+            summary = self._format_diff_summary(display_data)
+            return [f"● {title} [{status}]", f"  {summary}", *markup.splitlines()]
 
         if is_error:
             return [f"● {name} failed"]
@@ -173,6 +253,16 @@ class ToolSummarySection(Static):
             lines = lines[:-1]
         return len(lines)
 
+    def _format_diff_summary(self, display_data: dict) -> str:
+        additions = int(display_data.get("additions", 0) or 0)
+        removals = int(display_data.get("removals", 0) or 0)
+        parts: list[str] = []
+        if additions:
+            parts.append(f"Added {additions} line{'s' if additions != 1 else ''}")
+        if removals:
+            parts.append(f"Removed {removals} line{'s' if removals != 1 else ''}")
+        return ", ".join(parts) if parts else "No line changes"
+
 
 class AssistantMessage(Container):
     """Container: optional thinking + markdown response."""
@@ -185,6 +275,7 @@ class AssistantMessage(Container):
     """
 
     def compose(self) -> ComposeResult:
+        yield AssistantLoadingIndicator(id="assistant-loading")
         yield Markdown()
 
     def on_resize(self, event) -> None:
@@ -197,9 +288,11 @@ class AssistantMessage(Container):
             pass
 
     def update_text(self, text: str) -> None:
+        self._stop_loading()
         self.query_one(Markdown).update(text)
 
     async def set_thinking(self, text: str, streaming: bool) -> None:
+        self._stop_loading()
         section = self._get_thinking_section()
         if section is None:
             section = ThinkingSection(streaming=streaming, id="thinking-section")
@@ -208,12 +301,20 @@ class AssistantMessage(Container):
         section.update_thinking(text, streaming)
 
     async def add_tool_use(self, tool_call_id: str, tool_name: str, tool_input: dict | None) -> None:
+        self._stop_loading()
         section = await self._ensure_tool_summary_section()
         section.add_tool_use(tool_call_id, tool_name, tool_input)
 
-    async def set_tool_result(self, tool_call_id: str, output: str, is_error: bool) -> None:
+    async def set_tool_result(
+        self,
+        tool_call_id: str,
+        output: str,
+        is_error: bool,
+        display_data: dict | None = None,
+    ) -> None:
+        self._stop_loading()
         section = await self._ensure_tool_summary_section()
-        section.set_tool_result(tool_call_id, output, is_error)
+        section.set_tool_result(tool_call_id, output, is_error, display_data)
 
     def toggle_thinking(self) -> bool:
         toggled = False
@@ -246,3 +347,14 @@ class AssistantMessage(Container):
             md = self.query_one(Markdown)
             await self.mount(section, before=md)
         return section
+
+    def _stop_loading(self) -> None:
+        try:
+            loading = self.query_one("#assistant-loading", AssistantLoadingIndicator)
+        except Exception:
+            return
+        loading.stop()
+        loading.display = False
+
+    def finalize_pending_state(self) -> None:
+        self._stop_loading()

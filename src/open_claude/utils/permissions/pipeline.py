@@ -348,6 +348,12 @@ async def has_permissions_to_use_tool(
 
     # ---- Step 4: Mode transformations ----
 
+    if context.mode == PermissionMode.ACCEPT_EDITS and tool_name in {"Edit", "Write"}:
+        return PermissionAllowDecision(
+            updated_input=input_data,
+            decision_reason=ModeDecisionReason(mode=PermissionMode.ACCEPT_EDITS),
+        )
+
     # dontAsk mode: convert ask -> deny
     if context.mode == PermissionMode.DONT_ASK:
         return PermissionDenyDecision(

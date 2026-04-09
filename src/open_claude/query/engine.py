@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator
@@ -14,11 +15,18 @@ from open_claude.utils.permissions.pipeline import has_permissions_to_use_tool
 from open_claude.query.message_builder import (
     build_assistant_message,
     build_tool_result_message,
+    build_user_message,
     normalize_messages,
 )
 from open_claude.query.streaming import parse_stream
 from open_claude.query.types import ContentBlock, QueryResult, StreamEvent, TokenUsage
-from open_claude.schemas import ToolResult
+from open_claude.schemas import ToolExecutionResult, ToolResult
+from open_claude.utils.diff import display_data_for_preview, preview_for_tool_input
+from open_claude.utils.message_queue_manager import (
+    drain_pending_task_notifications,
+    get_commands_by_max_priority,
+    remove_commands,
+)
 
 
 class QueryEngine:
@@ -64,6 +72,7 @@ class QueryEngine:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
+        abort_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Run a single agentic turn: stream API call and parse the response.
 
@@ -83,6 +92,9 @@ class QueryEngine:
                 **self._build_stream_kwargs(messages, tools)
             ) as stream:
                 async for event in parse_stream(stream):
+                    if abort_event is not None and abort_event.is_set():
+                        yield StreamEvent(type="stop", content="aborted_streaming")
+                        return
                     yield event
 
                     # Accumulate usage from stop events
@@ -95,8 +107,9 @@ class QueryEngine:
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
-        tool_executor: Callable[[str, dict], Awaitable[str]] | None = None,
+        tool_executor: Callable[[str, dict], Awaitable[ToolExecutionResult]] | None = None,
         max_turns: int = 50,
+        abort_event: asyncio.Event | None = None,
     ) -> AsyncGenerator[StreamEvent, None]:
         """Full agentic loop with automatic tool execution.
 
@@ -121,14 +134,19 @@ class QueryEngine:
         messages.extend(working)
         turn_count = 0
         start_time = time.monotonic()
+        stop_reason = "end_turn"
 
         while turn_count < max_turns:
+            if abort_event is not None and abort_event.is_set():
+                stop_reason = "aborted"
+                break
+
             turn_count += 1
             stop_reason = "end_turn"
             tool_use_blocks: list[ContentBlock] = []
             assistant_blocks: list[dict[str, Any]] = []
 
-            async for event in self.query(messages, tools=tools):
+            async for event in self.query(messages, tools=tools, abort_event=abort_event):
                 yield event
 
                 if event.type == "tool_use" and isinstance(event.content, ContentBlock):
@@ -156,6 +174,9 @@ class QueryEngine:
             if assistant_blocks:
                 messages.append(build_assistant_message(assistant_blocks))
 
+            if stop_reason == "aborted_streaming":
+                break
+
             # If no tool calls or no executor, we're done
             if stop_reason != "tool_use" or not tool_use_blocks or tool_executor is None:
                 break
@@ -163,6 +184,10 @@ class QueryEngine:
             # Execute tools (with permission check)
             tool_results: list[ToolResult] = []
             for block in tool_use_blocks:
+                if abort_event is not None and abort_event.is_set():
+                    stop_reason = "aborted"
+                    break
+
                 tool_name = block.name or ""
                 tool_input = block.input or {}
 
@@ -178,6 +203,12 @@ class QueryEngine:
                             tool_call_id=block.id or "",
                             output=decision.message,
                             is_error=True,
+                            display_data=display_data_for_preview(
+                                preview_for_tool_input(tool_name, tool_input),
+                                tool_name=tool_name,
+                                status="rejected",
+                                dim=True,
+                            ),
                         )
                     )
                     yield StreamEvent(
@@ -213,6 +244,7 @@ class QueryEngine:
                                 tool_call_id=block.id or "",
                                 output=getattr(final_decision, "message", "Permission denied"),
                                 is_error=True,
+                                display_data=getattr(final_decision, "display_data", None),
                             )
                         )
                         yield StreamEvent(
@@ -227,15 +259,17 @@ class QueryEngine:
                     effective_input = tool_input
 
                 try:
-                    result_text = await tool_executor(
+                    execution_result = await tool_executor(
                         tool_name,
                         effective_input,
                     )
                     tool_results.append(
                         ToolResult(
                             tool_call_id=block.id or "",
-                            output=result_text,
+                            output=execution_result.output,
                             is_error=False,
+                            display_data=execution_result.display_data,
+                            new_messages=execution_result.new_messages,
                         )
                     )
                 except Exception as exc:
@@ -252,7 +286,19 @@ class QueryEngine:
             for tr in tool_results:
                 yield StreamEvent(type="tool_result", content=tr)
 
-            messages.append(build_tool_result_message(tool_results))
+            if tool_results:
+                messages.append(build_tool_result_message(tool_results))
+
+                # Inject new_messages from tool results as additional user messages
+                # (mirrors TS ToolResult.newMessages injection)
+                for tr in tool_results:
+                    if tr.new_messages:
+                        messages.extend(tr.new_messages)
+
+            if stop_reason == "aborted":
+                break
+
+            self._drain_mid_turn_commands(messages)
 
         # Yield final result summary
         duration_ms = (time.monotonic() - start_time) * 1000
@@ -304,3 +350,23 @@ class QueryEngine:
     def get_total_usage(self) -> TokenUsage:
         """Return accumulated token usage across all query calls."""
         return self._total_usage
+
+    def _drain_mid_turn_commands(self, messages: list[dict[str, Any]]) -> None:
+        """Inject task notifications before the next API turn.
+
+        User prompts stay queued until the current turn fully completes so the UI
+        can render them as independent turns with their own assistant blocks.
+        """
+        drain_pending_task_notifications()
+        queued = get_commands_by_max_priority(
+            "later",
+            filter_fn=lambda cmd: cmd.agent_id is None,
+        )
+        consumed = [
+            cmd for cmd in queued if cmd.mode == "task-notification"
+        ]
+        if not consumed:
+            return
+        for cmd in consumed:
+            messages.append(build_user_message(cmd.value))
+        remove_commands(consumed)

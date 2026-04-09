@@ -260,6 +260,7 @@ class PermissionAllowDecision:
     decision_reason: PermissionDecisionReason | None = None
     tool_use_id: str | None = None
     accept_feedback: str | None = None
+    display_data: dict[str, Any] | None = None
 
 
 @dataclass
@@ -280,6 +281,7 @@ class PermissionAskDecision:
     suggestions: list[PermissionUpdate] | None = None
     blocked_path: str | None = None
     pending_classifier_check: PendingClassifierCheck | None = None
+    display_data: dict[str, Any] | None = None
 
 
 @dataclass
@@ -288,6 +290,7 @@ class PermissionDenyDecision:
     message: str = ""
     decision_reason: PermissionDecisionReason | None = None
     tool_use_id: str | None = None
+    display_data: dict[str, Any] | None = None
 
 
 @dataclass
